@@ -1,0 +1,369 @@
+#!/bin/bash
+
+# ─────────────────────────────────────────────
+#  cleanmac — Interactive Mac Cleanup Tool
+#  https://github.com/mosayyyed/cleanmac
+# ─────────────────────────────────────────────
+
+VERSION="1.0.0"
+REPO="mosayyyed/cleanmac"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+FZF_BIN=$(which fzf 2>/dev/null || echo "/opt/homebrew/bin/fzf")
+
+PROJECT_ROOTS=(
+  "$HOME/AndroidStudioProjects"
+  "$HOME/StudioProjects"
+  "$HOME/DEV"
+  "$HOME/Development"
+)
+
+# ─── Helpers ──────────────────────────────────
+
+dir_size() {
+  local total=0
+  for path in "$@"; do
+    [ -e "$path" ] || continue
+    local s
+    s=$(du -sk "$path" 2>/dev/null | awk '{sum+=$1} END {print sum}')
+    total=$((total + ${s:-0}))
+  done
+  fmt_kb "$total"
+}
+
+kb_size() {
+  local total=0
+  for path in "$@"; do
+    [ -e "$path" ] || continue
+    local s
+    s=$(du -sk "$path" 2>/dev/null | awk '{sum+=$1} END {print sum}')
+    total=$((total + ${s:-0}))
+  done
+  echo "$total"
+}
+
+fmt_kb() {
+  local total="$1"
+  if [ "$total" -eq 0 ]; then echo "—"
+  elif [ "$total" -ge 1048576 ]; then awk "BEGIN {printf \"%.1f GB\", $total/1048576}"
+  elif [ "$total" -ge 1024 ]; then awk "BEGIN {printf \"%.1f MB\", $total/1024}"
+  else echo "${total} KB"
+  fi
+}
+
+disk_usage() {
+  df -h / | awk 'NR==2 {print "Used: "$3" / "$2" ("$5")"}'
+}
+
+# ─── Update check (background, non-blocking) ──
+_check_update() {
+  local latest
+  latest=$(curl -sf --max-time 3 \
+    "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' \
+    | sed 's/.*"v\([^"]*\)".*/\1/')
+  if [ -n "$latest" ] && [ "$latest" != "$VERSION" ]; then
+    echo -e "  ${YELLOW}⚡ Update available: v${latest}  →  run: cleanmac --update${NC}\n"
+  fi
+}
+
+# ══════════════════════════════════════════════
+#  DEV MODE  —  cleanmac --dev
+# ══════════════════════════════════════════════
+dev_mode() {
+  echo ""
+  echo -e "${BOLD}${CYAN}  🛠  cleanmac --dev  —  Developer-Safe Cleanup${NC}"
+  echo -e "${DIM}  Scanning build artifacts (environment stays intact)...${NC}"
+  echo ""
+
+  local BEFORE
+  BEFORE=$(disk_usage)
+  echo -e "  ${DIM}Disk ${BEFORE}${NC}"
+  echo ""
+
+  local BUILD_DIRS=()
+  for root in "${PROJECT_ROOTS[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r d; do
+      BUILD_DIRS+=("$d")
+    done < <(find "$root" -maxdepth 3 -name "build" -type d 2>/dev/null)
+  done
+
+  local GRADLE_KB ANDROID_KB XCODE_D_KB XCODE_A_KB NPM_KB VSCODE_KB PODS_KB BUILD_KB
+  BUILD_KB=0
+
+  GRADLE_KB=$(kb_size ~/.gradle/caches)
+  ANDROID_KB=$(kb_size ~/.android/build-cache ~/.android/cache)
+  XCODE_D_KB=$(kb_size ~/Library/Developer/Xcode/DerivedData)
+  XCODE_A_KB=$(kb_size ~/Library/Developer/Xcode/Archives)
+  NPM_KB=$(kb_size ~/.npm/_cacache)
+  VSCODE_KB=$(kb_size ~/Library/Application\ Support/Code/Cache \
+                       ~/Library/Application\ Support/Code/CachedData)
+  PODS_KB=$(kb_size ~/Library/Caches/CocoaPods)
+
+  for d in "${BUILD_DIRS[@]}"; do
+    local s
+    s=$(kb_size "$d")
+    BUILD_KB=$((BUILD_KB + s))
+  done
+
+  local TOTAL_KB=$((GRADLE_KB + ANDROID_KB + XCODE_D_KB + XCODE_A_KB +
+                    NPM_KB + VSCODE_KB + PODS_KB + BUILD_KB))
+
+  echo -e "  ${BOLD}Will clean:${NC}"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Gradle caches (~/.gradle/caches)"  "$(fmt_kb $GRADLE_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Android build cache"               "$(fmt_kb $ANDROID_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode DerivedData"                 "$(fmt_kb $XCODE_D_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode Archives"                    "$(fmt_kb $XCODE_A_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "npm cache"                         "$(fmt_kb $NPM_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "VS Code cache"                     "$(fmt_kb $VSCODE_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "CocoaPods download cache"          "$(fmt_kb $PODS_KB)"
+
+  if [ ${#BUILD_DIRS[@]} -gt 0 ]; then
+    printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Project build/ folders" "$(fmt_kb $BUILD_KB)"
+    for d in "${BUILD_DIRS[@]}"; do
+      local s
+      s=$(kb_size "$d")
+      [ "$s" -gt 0 ] || continue
+      local short="${d/$HOME/~}"
+      printf "         ${DIM}%-38s %s${NC}\n" "$short" "$(fmt_kb $s)"
+    done
+  fi
+
+  echo ""
+  echo -e "  ${DIM}Total estimate: ${BOLD}$(fmt_kb $TOTAL_KB)${NC}"
+  echo ""
+
+  echo -e "  ${RED}Won't touch${NC} ${DIM}(environment stays intact):${NC}"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.gradle/wrapper        (Gradle wrapper binaries)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.pub-cache             (Flutter/Dart packages)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.cocoapods             (CocoaPods specs repo)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/Library/Developer/CoreSimulator  (iOS Simulators)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "node_modules             (project dependencies)"
+  echo ""
+
+  printf "  ${YELLOW}Proceed? [y/N] ${NC}"
+  read -r confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e "\n  ${YELLOW}Cancelled. Nothing was deleted.${NC}\n"
+    exit 0
+  fi
+
+  echo ""
+
+  _clean() {
+    local label="$1"; shift
+    printf "  ${CYAN}Cleaning${NC} %-42s" "$label..."
+    for p in "$@"; do rm -rf "$p" 2>/dev/null; done
+    echo -e "${GREEN}done${NC}"
+  }
+
+  _clean "Gradle caches"            ~/.gradle/caches
+  _clean "Android build cache"      ~/.android/build-cache ~/.android/cache
+  _clean "Xcode DerivedData"        ~/Library/Developer/Xcode/DerivedData
+  _clean "Xcode Archives"           ~/Library/Developer/Xcode/Archives
+  _clean "npm cache"                ~/.npm/_cacache
+  _clean "VS Code cache"            \
+    ~/Library/Application\ Support/Code/Cache \
+    ~/Library/Application\ Support/Code/CachedData
+  _clean "CocoaPods download cache" ~/Library/Caches/CocoaPods
+
+  for d in "${BUILD_DIRS[@]}"; do
+    local short="${d/$HOME/~}"
+    _clean "build/  $short" "$d"
+  done
+
+  echo ""
+  echo -e "  ${DIM}────────────────────────────────────────────${NC}"
+  local AFTER
+  AFTER=$(disk_usage)
+  echo -e "  ${DIM}Before: ${BEFORE}${NC}"
+  echo -e "  ${BOLD}After:  ${AFTER}${NC}"
+  echo ""
+  echo -e "  ${GREEN}${BOLD}✅ Dev cleanup complete! Environment untouched.${NC}"
+  echo ""
+}
+
+# ══════════════════════════════════════════════
+#  INTERACTIVE MODE  —  cleanmac
+# ══════════════════════════════════════════════
+interactive_mode() {
+  echo ""
+  echo -e "${BOLD}${CYAN}  🧹 cleanmac — Interactive Mac Cleanup${NC}"
+  echo -e "${DIM}  Calculating cache sizes...${NC}"
+  echo ""
+
+  local KEYS=() LABELS=() PATHS_LIST=() SIZES_LIST=()
+
+  add_entry() {
+    local key="$1" label="$2"
+    shift 2
+    KEYS+=("$key")
+    LABELS+=("$label")
+    PATHS_LIST+=("$*")
+    SIZES_LIST+=("$(dir_size "$@")")
+  }
+
+  get_idx() {
+    local key="$1"
+    local i
+    for i in "${!KEYS[@]}"; do
+      [ "${KEYS[$i]}" = "$key" ] && echo "$i" && return
+    done
+    echo -1
+  }
+
+  add_entry "gradle"       "Gradle caches"                ~/.gradle/caches ~/.gradle/wrapper
+  add_entry "android"      "Android build cache"          ~/.android/build-cache ~/.android/cache
+  add_entry "cocoapods"    "CocoaPods cache"              ~/.cocoapods ~/Library/Caches/CocoaPods
+  add_entry "flutter"      "Flutter / Dart pub cache"     ~/.pub-cache ~/.dartServer
+  add_entry "xcode"        "Xcode DerivedData & Archives" \
+                             ~/Library/Developer/Xcode/DerivedData \
+                             ~/Library/Developer/Xcode/Archives
+  add_entry "simulators"   "iOS Simulators"               ~/Library/Developer/CoreSimulator
+  add_entry "npm"          "npm cache"                    ~/.npm/_cacache
+  add_entry "vscode"       "VS Code cache"                \
+                             ~/Library/Application\ Support/Code/Cache \
+                             ~/Library/Application\ Support/Code/CachedData
+  add_entry "syscache"     "System ~/Library/Caches"      ~/Library/Caches
+  add_entry "containers"   "App Containers cache"         ~/Library/Containers
+  add_entry "grpcontainer" "Group Containers cache"       ~/Library/Group\ Containers
+  add_entry "trash"        "Trash"                        ~/.Trash
+
+  local FZF_INPUT=""
+  local i
+  for i in "${!KEYS[@]}"; do
+    FZF_INPUT+=$(printf "%-34s  %s" "${LABELS[$i]}" "${SIZES_LIST[$i]}")
+    FZF_INPUT+=$'\n'
+  done
+
+  local BEFORE
+  BEFORE=$(disk_usage)
+  echo -e "  ${DIM}Disk ${BEFORE}${NC}"
+  echo ""
+
+  local SELECTED
+  SELECTED=$(echo "$FZF_INPUT" | "$FZF_BIN" \
+    --multi \
+    --ansi \
+    --height=60% \
+    --border=rounded \
+    --prompt="  Select items to clean (TAB = toggle, ENTER = confirm): " \
+    --header="  SPACE/TAB = toggle   CTRL-A = select all   ESC = cancel" \
+    --marker="✓" \
+    --pointer="▶" \
+    --color="header:italic,prompt:cyan,marker:green,pointer:cyan")
+
+  if [ -z "$SELECTED" ]; then
+    echo -e "\n  ${YELLOW}Cancelled. Nothing was deleted.${NC}\n"
+    exit 0
+  fi
+
+  local TO_CLEAN=()
+  while IFS= read -r line; do
+    local label
+    label=$(echo "$line" | sed 's/  \+[^ ].*//' | xargs)
+    for i in "${!LABELS[@]}"; do
+      if [ "${LABELS[$i]}" = "$label" ]; then
+        TO_CLEAN+=("${KEYS[$i]}")
+        break
+      fi
+    done
+  done <<< "$SELECTED"
+
+  if [ ${#TO_CLEAN[@]} -eq 0 ]; then
+    echo -e "\n  ${YELLOW}Nothing selected. Exiting.${NC}\n"
+    exit 0
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}Will clean:${NC}"
+  local key
+  for key in "${TO_CLEAN[@]}"; do
+    local idx
+    idx=$(get_idx "$key")
+    printf "    ${GREEN}✓${NC}  %-34s ${DIM}(%s)${NC}\n" "${LABELS[$idx]}" "${SIZES_LIST[$idx]}"
+  done
+
+  echo ""
+  printf "  ${YELLOW}Proceed? [y/N] ${NC}"
+  read -r confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e "\n  ${YELLOW}Cancelled.${NC}\n"
+    exit 0
+  fi
+
+  echo ""
+  for key in "${TO_CLEAN[@]}"; do
+    local idx
+    idx=$(get_idx "$key")
+    printf "  ${CYAN}Cleaning${NC} %-40s" "${LABELS[$idx]}..."
+
+    case "$key" in
+      flutter)
+        flutter clean 2>/dev/null
+        rm -rf ~/.pub-cache ~/.dartServer 2>/dev/null
+        ;;
+      *)
+        local p
+        for p in ${PATHS_LIST[$idx]}; do
+          rm -rf "$p" 2>/dev/null
+        done
+        ;;
+    esac
+
+    echo -e "${GREEN}done${NC}"
+  done
+
+  echo ""
+  echo -e "  ${DIM}────────────────────────────────────────────${NC}"
+  local AFTER
+  AFTER=$(disk_usage)
+  echo -e "  ${DIM}Before: ${BEFORE}${NC}"
+  echo -e "  ${BOLD}After:  ${AFTER}${NC}"
+  echo ""
+  echo -e "  ${GREEN}${BOLD}✅ Cleanup complete!${NC}"
+  echo ""
+}
+
+# ══════════════════════════════════════════════
+#  DISPATCH
+# ══════════════════════════════════════════════
+case "$1" in
+  --dev|-d)
+    _check_update &
+    dev_mode
+    ;;
+  --update)
+    echo ""
+    echo -e "  ${CYAN}Updating cleanmac...${NC}"
+    brew upgrade cleanmac 2>/dev/null \
+      || { echo -e "  ${RED}Not installed via Homebrew.${NC}"; echo -e "  Install: brew install mosayyyed/cleanmac/cleanmac"; }
+    echo ""
+    ;;
+  --version|-v)
+    echo "cleanmac v${VERSION}"
+    ;;
+  --help|-h)
+    echo ""
+    echo -e "  ${BOLD}cleanmac v${VERSION}${NC} — Mac Cleanup Tool"
+    echo -e "  ${DIM}https://github.com/${REPO}${NC}"
+    echo ""
+    echo -e "  ${CYAN}cleanmac${NC}           Interactive mode — choose what to clean"
+    echo -e "  ${CYAN}cleanmac --dev${NC}     Dev-safe mode — build artifacts only, env untouched"
+    echo -e "  ${CYAN}cleanmac --update${NC}  Update to latest version"
+    echo -e "  ${CYAN}cleanmac --version${NC} Show current version"
+    echo ""
+    ;;
+  *)
+    _check_update &
+    interactive_mode
+    ;;
+esac

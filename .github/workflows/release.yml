@@ -25,12 +25,12 @@ jobs:
 
       - name: Compute SHA256
         id: sha256
-        run: echo "SHA=$(sha256sum bin/cleanmac | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+        run: echo "SHA=$(sha256sum cleanmac | cut -d' ' -f1)" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/cleanmac
+          files: cleanmac
           generate_release_notes: true
           name: "cleanmac v${{ steps.version.outputs.VERSION }}"
 

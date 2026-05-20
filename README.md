@@ -1,5 +1,7 @@
 # cleanmac
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+
 Interactive Mac cleanup tool for developers. Free up disk space without breaking your dev environment.
 
 ## Install

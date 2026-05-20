@@ -269,7 +269,7 @@ interactive_mode() {
   local TO_CLEAN=()
   while IFS= read -r line; do
     local label
-    label=$(echo "$line" | sed 's/  \+[^ ].*//' | xargs)
+    label=$(echo "$line" | sed -E 's/  +[^ ].*//' | xargs)
     for i in "${!LABELS[@]}"; do
       if [ "${LABELS[$i]}" = "$label" ]; then
         TO_CLEAN+=("${KEYS[$i]}")

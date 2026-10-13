@@ -2,11 +2,10 @@
 
 # ─────────────────────────────────────────────
 #  cleanmac — Interactive Mac Cleanup Tool
-#  https://github.com/mosayyyed/cleanmac
+#  Usage:
+#    cleanmac          → interactive mode (fzf)
+#    cleanmac --dev    → dev-safe: build artifacts only
 # ─────────────────────────────────────────────
-
-VERSION="1.0.0"
-REPO="mosayyyed/cleanmac"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,7 +22,18 @@ PROJECT_ROOTS=(
   "$HOME/StudioProjects"
   "$HOME/DEV"
   "$HOME/Development"
+  "$HOME/Desktop"
+  "$HOME/Projects"
+  "$HOME/Documents"
 )
+
+# NDK version Flutter uses by default (read straight from the SDK; fallback if not found)
+flutter_ndk_default() {
+  local froot kt
+  froot=$(dirname "$(dirname "$(readlink -f "$(command -v flutter)" 2>/dev/null)")" 2>/dev/null)
+  kt="$froot/packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt"
+  [ -f "$kt" ] && grep -oE '[0-9]+\.[0-9]+\.[0-9]{6,}' "$kt" | head -1
+}
 
 # ─── Helpers ──────────────────────────────────
 
@@ -59,19 +69,12 @@ fmt_kb() {
 }
 
 disk_usage() {
-  df -h / | awk 'NR==2 {print "Used: "$3" / "$2" ("$5")"}'
-}
-
-# ─── Update check (background, non-blocking) ──
-_check_update() {
-  local latest
-  latest=$(curl -sf --max-time 3 \
-    "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' \
-    | sed 's/.*"v\([^"]*\)".*/\1/')
-  if [ -n "$latest" ] && [ "$latest" != "$VERSION" ]; then
-    echo -e "  ${YELLOW}⚡ Update available: v${latest}  →  run: cleanmac --update${NC}\n"
-  fi
+  # Read the Data volume, not "/" — on modern macOS "/" is the sealed read-only
+  # system volume (~16 GB), so it reports a misleadingly low "used" figure while
+  # the disk is actually full. Fall back to "/" on older layouts.
+  local vol="/System/Volumes/Data"
+  [ -d "$vol" ] || vol="/"
+  df -h "$vol" | awk 'NR==2 {print "Used: "$3" / "$2" ("$5")"}'
 }
 
 # ══════════════════════════════════════════════
@@ -88,25 +91,85 @@ dev_mode() {
   echo -e "  ${DIM}Disk ${BEFORE}${NC}"
   echo ""
 
+  # Scan project build/ folders — only where the parent dir has a project marker,
+  # so we never grab a random ~/Desktop/Build folder of real work.
   local BUILD_DIRS=()
   for root in "${PROJECT_ROOTS[@]}"; do
     [ -d "$root" ] || continue
     while IFS= read -r d; do
-      BUILD_DIRS+=("$d")
-    done < <(find "$root" -maxdepth 3 -name "build" -type d 2>/dev/null)
+      # exact-case "build" only (skip "Build" etc. on case-insensitive FS)
+      [ "$(basename "$d")" = "build" ] || continue
+      local parent
+      parent=$(dirname "$d")
+      if compgen -G "$parent/pubspec.yaml" >/dev/null 2>&1 || \
+         compgen -G "$parent/build.gradle*" >/dev/null 2>&1 || \
+         compgen -G "$parent/settings.gradle*" >/dev/null 2>&1; then
+        BUILD_DIRS+=("$d")
+      fi
+    done < <(find "$root" -maxdepth 4 -iname "build" -type d 2>/dev/null)
   done
 
-  local GRADLE_KB ANDROID_KB XCODE_D_KB XCODE_A_KB NPM_KB VSCODE_KB PODS_KB BUILD_KB
-  BUILD_KB=0
+  # Scan per-project regenerable caches: .dart_tool (flutter pub get),
+  # ios/macos Pods (pod install) and project-local .gradle. These are the single
+  # biggest reclaim on this machine and are all rebuilt by a normal build.
+  local DART_DIRS=()
+  for root in "${PROJECT_ROOTS[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r d; do
+      DART_DIRS+=("$d")
+    done < <(find "$root" -maxdepth 4 \
+               \( -name ".dart_tool" -o -name "Pods" -o -name ".gradle" \) \
+               -type d -prune 2>/dev/null)
+  done
+
+  # Which NDK versions to drop (keep Flutter's default + the newest installed)
+  local NDK_ROOT="$HOME/Library/Android/sdk/ndk"
+  local NDK_KEEP_DEFAULT NDK_KEEP_NEWEST
+  NDK_KEEP_DEFAULT=$(flutter_ndk_default)
+  local NDK_DROP=()
+  if [ -d "$NDK_ROOT" ]; then
+    NDK_KEEP_NEWEST=$(ls "$NDK_ROOT" 2>/dev/null | sort -V | tail -1)
+    local v
+    for v in $(ls "$NDK_ROOT" 2>/dev/null); do
+      [ "$v" = "$NDK_KEEP_DEFAULT" ] && continue
+      [ "$v" = "$NDK_KEEP_NEWEST" ] && continue
+      NDK_DROP+=("$NDK_ROOT/$v")
+    done
+  fi
+
+  # Calculate sizes
+  local GRADLE_KB ANDROID_KB XCODE_D_KB XCODE_A_KB XCODE_U_KB NPM_KB VSCODE_KB PODS_KB
+  local MISC_KB NDK_KB BUILD_KB=0
+  local AICACHE_KB SHOREBIRD_KB DARTTOOL_KB=0
 
   GRADLE_KB=$(kb_size ~/.gradle/caches)
   ANDROID_KB=$(kb_size ~/.android/build-cache ~/.android/cache)
   XCODE_D_KB=$(kb_size ~/Library/Developer/Xcode/DerivedData)
   XCODE_A_KB=$(kb_size ~/Library/Developer/Xcode/Archives)
+  XCODE_U_KB=$(kb_size ~/Library/Developer/Xcode/UserData/"IB Support" \
+                       ~/Library/Developer/Xcode/UserData/"IB%20Support" \
+                       ~/Library/Developer/Xcode/UserData/Previews)
   NPM_KB=$(kb_size ~/.npm/_cacache)
   VSCODE_KB=$(kb_size ~/Library/Application\ Support/Code/Cache \
-                       ~/Library/Application\ Support/Code/CachedData)
+                       ~/Library/Application\ Support/Code/CachedData \
+                       ~/Library/Application\ Support/Code/CachedExtensionVSIXs \
+                       ~/Library/Caches/com.microsoft.VSCode.ShipIt)
   PODS_KB=$(kb_size ~/Library/Caches/CocoaPods)
+  MISC_KB=$(kb_size ~/Library/Caches/typescript ~/Library/Caches/node-gyp \
+                    ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache)
+  # AI/tooling caches found filling the disk (all re-download on demand)
+  AICACHE_KB=$(kb_size ~/.cache/codex-runtimes ~/.cache/uv ~/.cache/puppeteer \
+                       ~/Library/Caches/Codex)
+  SHOREBIRD_KB=$(kb_size ~/.shorebird/bin/cache)
+  NDK_KB=$(kb_size "${NDK_DROP[@]}")
+
+  # Flutter/Dart per-project analysis caches + CocoaPods installs (regenerate on
+  # `flutter pub get` / `pod install`) — biggest single win on this machine.
+  for d in "${DART_DIRS[@]}"; do
+    local s2
+    s2=$(kb_size "$d")
+    DARTTOOL_KB=$((DARTTOOL_KB + s2))
+  done
 
   for d in "${BUILD_DIRS[@]}"; do
     local s
@@ -114,17 +177,37 @@ dev_mode() {
     BUILD_KB=$((BUILD_KB + s))
   done
 
-  local TOTAL_KB=$((GRADLE_KB + ANDROID_KB + XCODE_D_KB + XCODE_A_KB +
-                    NPM_KB + VSCODE_KB + PODS_KB + BUILD_KB))
+  local TOTAL_KB=$((GRADLE_KB + ANDROID_KB + XCODE_D_KB + XCODE_A_KB + XCODE_U_KB +
+                    NPM_KB + VSCODE_KB + PODS_KB + MISC_KB + NDK_KB + BUILD_KB +
+                    AICACHE_KB + SHOREBIRD_KB + DARTTOOL_KB))
 
+  # Show plan
   echo -e "  ${BOLD}Will clean:${NC}"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Gradle caches (~/.gradle/caches)"  "$(fmt_kb $GRADLE_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Android build cache"               "$(fmt_kb $ANDROID_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode DerivedData"                 "$(fmt_kb $XCODE_D_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode Archives"                    "$(fmt_kb $XCODE_A_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "npm cache"                         "$(fmt_kb $NPM_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "VS Code cache"                     "$(fmt_kb $VSCODE_KB)"
-  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "CocoaPods download cache"          "$(fmt_kb $PODS_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Gradle caches (~/.gradle/caches)" "$(fmt_kb $GRADLE_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Android build cache" "$(fmt_kb $ANDROID_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode DerivedData" "$(fmt_kb $XCODE_D_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode Archives" "$(fmt_kb $XCODE_A_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Xcode IB Support + Previews cache" "$(fmt_kb $XCODE_U_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "npm cache" "$(fmt_kb $NPM_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "VS Code cache + ShipIt + VSIXs" "$(fmt_kb $VSCODE_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "CocoaPods download cache" "$(fmt_kb $PODS_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "typescript / node-gyp / Google updater" "$(fmt_kb $MISC_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "codex / uv / puppeteer caches" "$(fmt_kb $AICACHE_KB)"
+  printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Shorebird cache" "$(fmt_kb $SHOREBIRD_KB)"
+
+  if [ ${#DART_DIRS[@]} -gt 0 ]; then
+    printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Project .dart_tool / Pods / .gradle" "$(fmt_kb $DARTTOOL_KB)"
+  fi
+
+  if [ ${#NDK_DROP[@]} -gt 0 ]; then
+    printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Old Android NDK versions" "$(fmt_kb $NDK_KB)"
+    local n
+    for n in "${NDK_DROP[@]}"; do
+      printf "         ${DIM}%-38s %s${NC}\n" "$(basename "$n")" "$(fmt_kb "$(kb_size "$n")")"
+    done
+    printf "         ${DIM}keeping: %s (flutter), %s (newest)${NC}\n" \
+      "${NDK_KEEP_DEFAULT:-none}" "${NDK_KEEP_NEWEST:-none}"
+  fi
 
   if [ ${#BUILD_DIRS[@]} -gt 0 ]; then
     printf "    ${GREEN}✓${NC}  %-40s ${DIM}%s${NC}\n" "Project build/ folders" "$(fmt_kb $BUILD_KB)"
@@ -138,6 +221,8 @@ dev_mode() {
   fi
 
   echo ""
+  echo -e "  ${DIM}Also runs: xcrun simctl delete unavailable  •  brew cleanup --prune=all${NC}"
+  echo ""
   echo -e "  ${DIM}Total estimate: ${BOLD}$(fmt_kb $TOTAL_KB)${NC}"
   echo ""
 
@@ -145,7 +230,8 @@ dev_mode() {
   printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.gradle/wrapper        (Gradle wrapper binaries)"
   printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.pub-cache             (Flutter/Dart packages)"
   printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/.cocoapods             (CocoaPods specs repo)"
-  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/Library/Developer/CoreSimulator  (iOS Simulators)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "~/Library/Developer/CoreSimulator  (simulator data)"
+  printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "NDK: flutter default + newest      (kept)"
   printf "    ${RED}✗${NC}  ${DIM}%s${NC}\n" "node_modules             (project dependencies)"
   echo ""
 
@@ -169,16 +255,46 @@ dev_mode() {
   _clean "Android build cache"      ~/.android/build-cache ~/.android/cache
   _clean "Xcode DerivedData"        ~/Library/Developer/Xcode/DerivedData
   _clean "Xcode Archives"           ~/Library/Developer/Xcode/Archives
+  _clean "Xcode IB/Previews cache"  \
+    ~/Library/Developer/Xcode/UserData/"IB Support" \
+    ~/Library/Developer/Xcode/UserData/"IB%20Support" \
+    ~/Library/Developer/Xcode/UserData/Previews
   _clean "npm cache"                ~/.npm/_cacache
-  _clean "VS Code cache"            \
+  _clean "VS Code cache + ShipIt"   \
     ~/Library/Application\ Support/Code/Cache \
-    ~/Library/Application\ Support/Code/CachedData
+    ~/Library/Application\ Support/Code/CachedData \
+    ~/Library/Application\ Support/Code/CachedExtensionVSIXs \
+    ~/Library/Caches/com.microsoft.VSCode.ShipIt
   _clean "CocoaPods download cache" ~/Library/Caches/CocoaPods
+  _clean "ts / node-gyp / updater"  \
+    ~/Library/Caches/typescript \
+    ~/Library/Caches/node-gyp \
+    ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache
+
+  _clean "codex / uv / puppeteer caches" \
+    ~/.cache/codex-runtimes ~/.cache/uv ~/.cache/puppeteer ~/Library/Caches/Codex
+  _clean "Shorebird cache"          ~/.shorebird/bin/cache
+
+  if [ ${#NDK_DROP[@]} -gt 0 ]; then
+    _clean "Old Android NDK versions" "${NDK_DROP[@]}"
+  fi
+
+  if [ ${#DART_DIRS[@]} -gt 0 ]; then
+    _clean "Project .dart_tool / Pods / .gradle" "${DART_DIRS[@]}"
+  fi
 
   for d in "${BUILD_DIRS[@]}"; do
     local short="${d/$HOME/~}"
     _clean "build/  $short" "$d"
   done
+
+  printf "  ${CYAN}Cleaning${NC} %-42s" "simulators (unavailable)..."
+  xcrun simctl delete unavailable >/dev/null 2>&1
+  echo -e "${GREEN}done${NC}"
+
+  printf "  ${CYAN}Cleaning${NC} %-42s" "Homebrew cache..."
+  brew cleanup --prune=all >/dev/null 2>&1
+  echo -e "${GREEN}done${NC}"
 
   echo ""
   echo -e "  ${DIM}────────────────────────────────────────────${NC}"
@@ -200,6 +316,7 @@ interactive_mode() {
   echo -e "${DIM}  Calculating cache sizes...${NC}"
   echo ""
 
+  # Parallel indexed arrays (no associative arrays — bash 3.2 compat)
   local KEYS=() LABELS=() PATHS_LIST=() SIZES_LIST=()
 
   add_entry() {
@@ -226,8 +343,13 @@ interactive_mode() {
   add_entry "flutter"      "Flutter / Dart pub cache"     ~/.pub-cache ~/.dartServer
   add_entry "xcode"        "Xcode DerivedData & Archives" \
                              ~/Library/Developer/Xcode/DerivedData \
-                             ~/Library/Developer/Xcode/Archives
+                             ~/Library/Developer/Xcode/Archives \
+                             ~/Library/Developer/Xcode/UserData/"IB Support" \
+                             ~/Library/Developer/Xcode/UserData/"IB%20Support" \
+                             ~/Library/Developer/Xcode/UserData/Previews
   add_entry "simulators"   "iOS Simulators"               ~/Library/Developer/CoreSimulator
+  add_entry "claudevm"     "Claude Code sandbox VM (re-downloads)" \
+                             ~/Library/Application\ Support/Claude/vm_bundles
   add_entry "npm"          "npm cache"                    ~/.npm/_cacache
   add_entry "vscode"       "VS Code cache"                \
                              ~/Library/Application\ Support/Code/Cache \
@@ -338,32 +460,18 @@ interactive_mode() {
 # ══════════════════════════════════════════════
 case "$1" in
   --dev|-d)
-    _check_update &
     dev_mode
-    ;;
-  --update)
-    echo ""
-    echo -e "  ${CYAN}Updating cleanmac...${NC}"
-    brew upgrade cleanmac 2>/dev/null \
-      || { echo -e "  ${RED}Not installed via Homebrew.${NC}"; echo -e "  Install: brew install mosayyyed/cleanmac/cleanmac"; }
-    echo ""
-    ;;
-  --version|-v)
-    echo "cleanmac v${VERSION}"
     ;;
   --help|-h)
     echo ""
-    echo -e "  ${BOLD}cleanmac v${VERSION}${NC} — Mac Cleanup Tool"
-    echo -e "  ${DIM}https://github.com/${REPO}${NC}"
+    echo -e "  ${BOLD}cleanmac${NC} — Mac Cleanup Tool"
     echo ""
-    echo -e "  ${CYAN}cleanmac${NC}           Interactive mode — choose what to clean"
-    echo -e "  ${CYAN}cleanmac --dev${NC}     Dev-safe mode — build artifacts only, env untouched"
-    echo -e "  ${CYAN}cleanmac --update${NC}  Update to latest version"
-    echo -e "  ${CYAN}cleanmac --version${NC} Show current version"
+    echo -e "  ${CYAN}cleanmac${NC}        Interactive mode — choose what to clean"
+    echo -e "  ${CYAN}cleanmac --dev${NC}  Dev-safe mode — build/IDE caches, project build/ dirs,"
+    echo -e "  ${DIM}                old NDK versions, unavailable simulators, brew cache${NC}"
     echo ""
     ;;
   *)
-    _check_update &
     interactive_mode
     ;;
 esac

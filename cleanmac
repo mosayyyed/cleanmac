@@ -5,7 +5,7 @@
 #  https://github.com/mosayyyed/cleanmac
 # ─────────────────────────────────────────────
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 REPO="mosayyyed/cleanmac"
 
 RED='\033[0;31m'
@@ -93,6 +93,11 @@ disk_usage() {
   df -h "$vol" | awk 'NR==2 {print "Used: "$3" / "$2" ("$5")"}'
 }
 
+# Items that survived a clean (SIP, file in use) are counted in this file so the
+# count survives the background subshell the spinner runs the work in.
+SKIP_FILE=$(mktemp -t cleanmac.XXXXXX 2>/dev/null || echo "/tmp/cleanmac.$$")
+trap 'rm -f "$SKIP_FILE"' EXIT
+
 # rm -rf each path. Fails if anything is still there afterwards (SIP, missing
 # Full Disk Access, file in use) so we never print a false "done".
 rm_paths() {
@@ -100,31 +105,66 @@ rm_paths() {
   for p in "$@"; do
     [ -e "$p" ] || continue
     rm -rf "$p" 2>/dev/null
-    [ -e "$p" ] && failed=1
+    [ -e "$p" ] && { failed=1; echo x >> "$SKIP_FILE"; }
   done
   return $failed
 }
 
-# Empty a directory but keep the directory itself (~/Library/Caches, ~/.Trash)
+# Empty a directory but keep the directory itself (~/Library/Caches, ~/.Trash).
+# Returns 2 when the directory can't even be listed (no Full Disk Access).
 rm_contents() {
   local dir="$1" p failed=0
   [ -d "$dir" ] || return 0
-  # unreadable, e.g. ~/.Trash when the terminal has no Full Disk Access
-  ls -A "$dir" >/dev/null 2>&1 || return 1
+  ls -A "$dir" >/dev/null 2>&1 || return 2
   for p in "$dir"/* "$dir"/.[!.]*; do
     [ -e "$p" ] || continue
     rm -rf "$p" 2>/dev/null
-    [ -e "$p" ] && failed=1
+    [ -e "$p" ] && { failed=1; echo x >> "$SKIP_FILE"; }
   done
   return $failed
 }
 
+# Trash is unreadable to the terminal without Full Disk Access — ask Finder to
+# empty it instead (macOS may ask once to allow controlling Finder).
+empty_trash() {
+  rm_contents ~/.Trash
+  local status=$?
+  [ $status -eq 2 ] || return $status
+  osascript -e 'tell application "Finder" to empty trash' >/dev/null 2>&1 && return 0
+  return 2
+}
+
+# Run "$@" in the background with a spinner + elapsed time, so long deletes
+# (~/.pub-cache is hundreds of thousands of files) don't look like a hang.
+run_spin() {
+  : > "$SKIP_FILE"
+  if [ ! -t 1 ]; then "$@"; return $?; fi
+  "$@" &
+  local pid=$! start=$SECONDS i=0
+  # background jobs ignore Ctrl-C in scripts — stop the delete ourselves
+  trap 'kill "$pid" 2>/dev/null; printf "\033[?25h\n"; exit 130' INT
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  printf '\0337\033[?25l'   # save cursor, hide it
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\0338\033[K%b%s %ds%b' "$DIM" "${frames[i % 10]}" $((SECONDS - start)) "$NC"
+    i=$((i + 1))
+    sleep 0.1
+  done
+  wait "$pid"
+  local status=$?
+  trap - INT
+  printf '\0338\033[K\033[?25h'  # restore cursor, clear spinner, show cursor
+  return $status
+}
+
 print_status() {
-  if [ "$1" -eq 0 ]; then
-    echo -e "${GREEN}done${NC}"
-  else
-    echo -e "${YELLOW}partial${NC} ${DIM}(protected or in use — Full Disk Access?)${NC}"
-  fi
+  local skipped
+  skipped=$(wc -l < "$SKIP_FILE" 2>/dev/null | tr -d ' ')
+  case "$1" in
+    0) echo -e "${GREEN}done${NC}" ;;
+    2) echo -e "${YELLOW}skipped${NC} ${DIM}(no access — give your terminal Full Disk Access)${NC}" ;;
+    *) echo -e "${GREEN}done${NC} ${DIM}(${skipped:-some} item(s) left: protected by macOS or in use)${NC}" ;;
+  esac
 }
 
 # ─── Update check (background, non-blocking) ──
@@ -318,8 +358,8 @@ dev_mode() {
 
   _clean() {
     local label="$1"; shift
-    printf "  ${CYAN}Cleaning${NC} %-42s" "$label..."
-    rm_paths "$@"
+    printf "  ${CYAN}Cleaning${NC} %-42s " "$label..."
+    run_spin rm_paths "$@"
     print_status $?
   }
 
@@ -356,12 +396,12 @@ dev_mode() {
     _clean "build/  $short" "$d"
   done
 
-  printf "  ${CYAN}Cleaning${NC} %-42s" "simulators (unavailable)..."
-  xcrun simctl delete unavailable >/dev/null 2>&1
+  printf "  ${CYAN}Cleaning${NC} %-42s " "simulators (unavailable)..."
+  run_spin sh -c 'xcrun simctl delete unavailable >/dev/null 2>&1'
   echo -e "${GREEN}done${NC}"
 
-  printf "  ${CYAN}Cleaning${NC} %-42s" "Homebrew cache..."
-  brew cleanup --prune=all >/dev/null 2>&1
+  printf "  ${CYAN}Cleaning${NC} %-42s " "Homebrew cache..."
+  run_spin sh -c 'brew cleanup --prune=all >/dev/null 2>&1'
   echo -e "${GREEN}done${NC}"
 
   echo ""
@@ -498,26 +538,38 @@ interactive_mode() {
     exit 0
   fi
 
+  # pad every "Cleaning <label>..." to the longest selected label
+  local width=0 idx
+  for key in "${TO_CLEAN[@]}"; do
+    idx=$(get_idx "$key")
+    [ ${#LABELS[$idx]} -gt $width ] && width=${#LABELS[$idx]}
+  done
+  width=$((width + 3))
+
+  # simulators: let CoreSimulator wipe its own devices — rm -rf under a running
+  # CoreSimulatorService leaves it in a broken state
+  _erase_simulators() {
+    xcrun simctl shutdown all >/dev/null 2>&1
+    xcrun simctl erase all >/dev/null 2>&1
+  }
+
   echo ""
   for key in "${TO_CLEAN[@]}"; do
     local idx status=0
     idx=$(get_idx "$key")
-    printf "  ${CYAN}Cleaning${NC} %-40s" "${LABELS[$idx]}..."
+    printf "  ${CYAN}Cleaning${NC} %-${width}s " "${LABELS[$idx]}..."
 
     case "$key" in
       simulators)
-        # let CoreSimulator wipe its own devices — rm -rf under a running
-        # CoreSimulatorService leaves it in a broken state
-        xcrun simctl shutdown all >/dev/null 2>&1
-        xcrun simctl erase all >/dev/null 2>&1
+        run_spin _erase_simulators
         status=$?
         ;;
       syscache)
-        rm_contents ~/Library/Caches
+        run_spin rm_contents ~/Library/Caches
         status=$?
         ;;
       trash)
-        rm_contents ~/.Trash
+        run_spin empty_trash
         status=$?
         ;;
       *)
@@ -525,7 +577,7 @@ interactive_mode() {
         while IFS= read -r p; do
           [ -n "$p" ] && paths+=("$p")
         done <<< "${PATHS_LIST[$idx]}"
-        rm_paths "${paths[@]}"
+        run_spin rm_paths "${paths[@]}"
         status=$?
         ;;
     esac
